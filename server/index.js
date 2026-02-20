@@ -14,6 +14,8 @@ import {
   isRateLimited
 } from './gemini.js';
 import { NPC_PERSONALITIES, NPC_CHAT_COLORS } from './NPCPersonalities.js';
+import { npcMemory, IMPORTANCE } from './NPCMemory.js';
+import { socialEngine, CHAT_RULES } from './NPCSocialEngine.js';
 
 const apiKeys = {
   groqKey: process.env.GROQ_API_KEY,
@@ -150,6 +152,23 @@ serverNPCs.forEach(npc => {
   worldState.npcs.set(npc.id, { ...npc });
 });
 
+// ── Inicializar Memory + Social Engine ──────────────────────
+const npcNames = Object.keys(NPC_PERSONALITIES);
+npcMemory.init(npcNames);
+socialEngine.init(npcNames);
+
+// Provide position data to social engine
+socialEngine.setPositionProvider(() => {
+  const positions = {};
+  for (const [id, npc] of worldState.npcs) {
+    positions[npc.name] = { x: npc.x, y: npc.y };
+  }
+  return positions;
+});
+
+console.log(`[Memory] 🧠 Memory system initialized for ${npcNames.join(', ')}`);
+console.log(`[Social] 🤝 Social engine initialized`);
+
 // ── Obtener actividad actual de cada NPC (para contexto IA) ─
 function getNPCActivities() {
   const activities = {};
@@ -166,6 +185,26 @@ function getNPCActivities() {
 
 // ── NPC Activity + Movement Loop ────────────────────────────
 setInterval(() => {
+  // Social engine tick — NPCs decide if they want to interact
+  const socialAction = socialEngine.tick();
+  
+  // Process seek intents — NPCs walk toward each other
+  const seeks = socialEngine.getSeekTargets();
+  for (const seek of seeks) {
+    const seekerNPC = Array.from(worldState.npcs.values()).find(n => n.name === seek.npc);
+    const targetNPC = Array.from(worldState.npcs.values()).find(n => n.name === seek.target);
+    if (seekerNPC && targetNPC) {
+      // Override current target to walk toward the other NPC
+      seekerNPC._targetX = targetNPC.x + (Math.random() - 0.5) * 60;
+      seekerNPC._targetY = targetNPC.y + (Math.random() - 0.5) * 60;
+      seekerNPC._targetX = Math.max(1100, Math.min(2000, seekerNPC._targetX));
+      seekerNPC._targetY = Math.max(1200, Math.min(1900, seekerNPC._targetY));
+      seekerNPC.currentAnimation = 'walk';
+      seekerNPC._activityTimer = 8000; // Give time to walk there
+      console.log(`[Social] 🚶 ${seek.npc} is walking toward ${seek.target} (${seek.reason})`);
+    }
+  }
+
   for (const [id, npc] of worldState.npcs) {
     const actDef = NPC_ACTIVITIES[npc.name];
     if (!actDef) continue;
@@ -492,15 +531,25 @@ io.on('connection', (socket) => {
 
       console.log(`[Chat] 💬 ${playerName} at (${Math.round(player?.x)},${Math.round(player?.y)}) | nearby: [${nearbyNPCs.join(', ')}] | viewport: ${player?.viewportW}x${player?.viewportH}`);
 
+      // ── Store player message in NPC memories ──
+      for (const npcName of nearbyNPCs) {
+        npcMemory.observeConversation(npcName, playerName, data.message, { activity: activities[npcName] });
+      }
+
+      // ── Build enhanced system prompt with memory ──
+      const enhancedPrompt = socialEngine.buildPlayerConversationPrompt(
+        playerName, data.message, activities, playerMem, npcMoods, nearbyNPCs
+      );
+
       // Un solo setTimeout con un solo request
       setTimeout(async () => {
         try {
-          const responses = await getAllNPCResponses(apiKeys, playerName, data.message, activities, playerMem, npcMoods);
+          const responses = await getAllNPCResponses(apiKeys, playerName, data.message, activities, playerMem, npcMoods, enhancedPrompt);
 
           // Si Gemini devuelve null (error/rate limit), usar fallback contextual
-          const npcNames = Object.keys(NPC_PERSONALITIES);
+          const allNpcNames = Object.keys(NPC_PERSONALITIES);
           const finalResponses = responses || getContextualFallback(activities,
-            npcNames.filter(k => msgLower.includes(k.toLowerCase()))
+            allNpcNames.filter(k => msgLower.includes(k.toLowerCase()))
           );
 
           // ── Filter by proximity: only nearby NPCs respond ──
@@ -544,32 +593,52 @@ io.on('connection', (socket) => {
             io.emit('ai-status', { status: 'ok' });
           }
           
-          // El NPC hablado responde primero (delay corto)
+          // ── Realistic response timing per NPC personality ──
+          // Delays are CUMULATIVE: each message waits for the previous one
           let idx = 0;
+          let accumulatedDelay = 0;
           for (const [npcKey, response] of entriesToUse) {
-            const delay = idx === 0 ? 800 : 1200 + idx * 1800 + Math.random() * 1000;
+            accumulatedDelay += socialEngine.getResponseDelay(npcKey, idx);
+            const delay = accumulatedDelay;
             
             setTimeout(() => {
               addToHistory(npcKey, response);
               broadcastNPCMessage(npcKey, response);
 
+              // ── Store NPC response in all nearby NPCs' memories ──
+              for (const otherNPC of nearbyNPCs) {
+                if (otherNPC !== npcKey) {
+                  npcMemory.observeConversation(otherNPC, npcKey, response, {});
+                }
+              }
+              // Store in the responding NPC's own memory too
+              npcMemory.addMemory(npcKey, {
+                type: 'episodic',
+                content: `Le dije a ${playerName}: "${response.substring(0, 60)}"`,
+                about: playerName,
+                tags: [playerName.toLowerCase(), 'conversación'],
+                importance: 3,
+                emotion: 'neutral'
+              });
+
               // ── Incrementar amistad por hablar ────────
               const friendship = worldState.friendship.get(socket.id);
               if (friendship) {
-                // Base friendship gain
                 let gain = 2;
-                // Bonus if NPC asks a question (showing interest)
                 if (response.includes('?') || response.includes('¿')) gain += 1;
-                // Bonus if player shared personal info this message
                 const newMemKeys = Object.keys(updatedMemory).filter(k => !existingMemory[k]);
                 if (newMemKeys.length > 0) gain += 2;
                 
                 friendship[npcKey] = Math.min(100, (friendship[npcKey] || 0) + gain);
                 
-                // Update NPC social mood from player interaction
                 if (npcMoods[npcKey]) {
                   npcMoods[npcKey].social = Math.min(100, npcMoods[npcKey].social + 10);
                   npcMoods[npcKey].happiness = Math.min(100, npcMoods[npcKey].happiness + 3);
+                }
+
+                // Update social engine drives
+                if (socialEngine.drives[npcKey]) {
+                  socialEngine.drives[npcKey].onConversation();
                 }
                 
                 const discoveries = detectDiscoveries(npcKey, response);
@@ -659,7 +728,6 @@ const npcRelationships = {
 // Log de vida NPC (para debug)
 const npcLifeLog = [];
 const MAX_LIFE_LOG = 100;
-const npcInteractionQueue = [];
 
 function logNPCLife(event) {
   event.time = Date.now();
@@ -681,67 +749,60 @@ setInterval(() => {
     if (mood.social < 20) mood.happiness = Math.max(10, mood.happiness - 1);
     if (mood.energy > 80) mood.happiness = Math.min(100, mood.happiness + 0.5);
 
-    // NPCs con poco social buscan interacción
-    if (mood.social < 25 && Math.random() < 0.1) {
-      npcInteractionQueue.push({
-        initiator: name,
-        type: 'social_need',
-        priority: 100 - mood.social
-      });
+    // Social engine handles the actual seeking behavior now
+    if (mood.social < 25) {
       logNPCLife({ type: 'mood', npc: name, detail: `${name} se siente solo (social: ${Math.round(mood.social)})` });
     }
   }
 }, 30000);
 
-// ── Interacciones orgánicas entre NPCs ──────────────────────
-// DISABLED: These consume 1 API request every 2-5 min, causing constant
-// rate limits on free tier. Player chat should get all the quota.
-// NPCs still move, animate, and respond when the player talks.
-const NPC_INTERACTIONS_ENABLED = false;
+// ── Interacciones orgánicas entre NPCs (Social Engine) ──────
+// Smart system: NPCs only chat when social drives demand it
+// Much more efficient than random timers
+const NPC_INTERACTIONS_ENABLED = true;
+
+// Process NPC-to-NPC conversations driven by social engine
 setInterval(async () => {
   if (!NPC_INTERACTIONS_ENABLED) return;
   if (worldState.players.size === 0 || !hasAI) return;
+  if (isRateLimited()) return;
 
-  // Procesar la queue de interacciones o generar una random
-  let interaction = npcInteractionQueue.shift();
+  // Check if social engine queued a conversation
+  const conversationReq = socialEngine.getNextConversation();
+  if (!conversationReq) return;
 
-  if (!interaction) {
-    // Chance de interacción espontánea basada en proximidad
-    const npcs = Array.from(worldState.npcs.values());
-    for (let i = 0; i < npcs.length; i++) {
-      for (let j = i + 1; j < npcs.length; j++) {
-        const dx = npcs[i].x - npcs[j].x;
-        const dy = npcs[i].y - npcs[j].y;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        if (dist < 200 && Math.random() < 0.3) {
-          interaction = {
-            initiator: npcs[i].name,
-            target: npcs[j].name,
-            type: 'proximity',
-            distance: Math.round(dist)
-          };
-          break;
-        }
-      }
-      if (interaction) break;
-    }
-  }
+  logNPCLife({ 
+    type: 'interaction', 
+    detail: `${conversationReq.initiator} quiere hablar con ${conversationReq.target} (${conversationReq.topic?.type || 'general'}: ${conversationReq.topic?.topic || ''})` 
+  });
 
-  if (!interaction) return;
-
-  logNPCLife({ type: 'interaction', detail: `${interaction.initiator} inicia interacción (${interaction.type})` });
+  console.log(`[Social] 💬 ${conversationReq.initiator} → ${conversationReq.target} (topic: ${conversationReq.topic?.topic || 'general'})`);
 
   const activities = getNPCActivities();
-  const conversation = await getNPCConversation(apiKeys, activities);
+  
+  // Use social engine's enhanced prompt builder
+  const { systemPrompt, userMsg } = socialEngine.buildConversationPrompt(conversationReq, activities);
+  
+  // Make AI request using existing infrastructure
+  const conversation = await getNPCConversation(apiKeys, activities, systemPrompt, userMsg);
 
   if (conversation) {
-    let delay = 0;
-    for (const [npcKey, message] of Object.entries(conversation)) {
+    // conversation is now an array: [{npc, msg}, {npc, msg}, ...]
+    // Use realistic timing from social engine
+    // Delays are CUMULATIVE: each message waits for the previous one
+    let accumulatedDelay = 0;
+    
+    for (let idx = 0; idx < conversation.length; idx++) {
+      const { npc: npcKey, msg: message } = conversation[idx];
+      if (!npcKey || !message) continue;
+      
+      accumulatedDelay += socialEngine.getResponseDelay(npcKey, idx);
+      const delay = accumulatedDelay;
+      
       setTimeout(() => {
         addToHistory(npcKey, message);
         broadcastNPCMessage(npcKey, message);
 
-        // Update moods from interaction
         if (npcMoods[npcKey]) {
           npcMoods[npcKey].social = Math.min(100, npcMoods[npcKey].social + 15);
           npcMoods[npcKey].happiness = Math.min(100, npcMoods[npcKey].happiness + 5);
@@ -749,14 +810,22 @@ setInterval(async () => {
 
         logNPCLife({ type: 'chat', npc: npcKey, message: message.substring(0, 50) });
       }, delay);
-      delay += 2500 + Math.random() * 1500;
     }
 
+    // Lock conversations until all messages have been displayed
+    socialEngine.lockConversation(accumulatedDelay + 2000);
+
+    // Notify social engine the conversation happened
+    socialEngine.afterConversation(
+      conversationReq.participants,
+      conversation
+    );
+
     // Update relationships
-    const speakers = Object.keys(conversation);
-    for (let i = 0; i < speakers.length; i++) {
-      for (let j = i + 1; j < speakers.length; j++) {
-        const a = speakers[i], b = speakers[j];
+    const speakerNames = [...new Set(conversation.map(t => t.npc).filter(Boolean))];
+    for (let i = 0; i < speakerNames.length; i++) {
+      for (let j = i + 1; j < speakerNames.length; j++) {
+        const a = speakerNames[i], b = speakerNames[j];
         if (npcRelationships[a]?.[b] !== undefined) {
           npcRelationships[a][b] = Math.min(100, npcRelationships[a][b] + 2);
         }
@@ -766,7 +835,7 @@ setInterval(async () => {
       }
     }
   }
-}, 120000 + Math.random() * 180000); // 2-5 minutos
+}, 8000); // Check every 8s (but social engine controls actual frequency via cooldowns)
 
 // ── AI status: emit only when it CHANGES (no flickering) ────
 let _prevAIStatus = 'ok';
@@ -883,14 +952,15 @@ app.get('/api/test-heartbeat', async (req, res) => {
   const activities = getNPCActivities();
   const conversation = await getNPCConversation(apiKeys, activities);
   if (conversation) {
-    // También emitirlo al juego
+    // conversation is now an array [{npc, msg}]
     let delay = 0;
-    for (const [npcKey, message] of Object.entries(conversation)) {
+    for (const { npc: npcKey, msg: message } of conversation) {
+      if (!npcKey || !message) continue;
       setTimeout(() => {
         addToHistory(npcKey, message);
         broadcastNPCMessage(npcKey, message);
       }, delay);
-      delay += 2000;
+      delay += 3000;
     }
   }
   res.json({ success: !!conversation, conversation });
@@ -911,8 +981,24 @@ app.get('/api/npc-life', (req, res) => {
     events: npcLifeLog.slice(-30),
     currentMoods: { ...npcMoods },
     relationships: { ...npcRelationships },
-    pendingInteractions: npcInteractionQueue.length
+    pendingInteractions: socialEngine.hasPendingConversations() ? socialEngine.conversationQueue.length : 0
   });
+});
+
+// ── DEBUG: NPC Memory System ────────────────────────────────
+app.get('/api/npc-memory', (req, res) => {
+  res.json({
+    memory: npcMemory.getDebugInfo(),
+    social: socialEngine.getDebugInfo()
+  });
+});
+
+// ── DEBUG: Try NPC recall ───────────────────────────────────
+app.get('/api/npc-recall', (req, res) => {
+  const npc = req.query.npc || 'Elena';
+  const query = req.query.q || 'shiny';
+  const result = npcMemory.tryRecall(npc, query, { maxResults: 5 });
+  res.json({ npc, query, result });
 });
 
 // ── Start ───────────────────────────────────────────────────

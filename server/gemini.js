@@ -167,6 +167,58 @@ function repairJSON(text) {
   return null;
 }
 
+// ── JSON REPAIR for conversation arrays [{npc, msg}] ────────
+function repairConversationArray(text) {
+  if (!text || text.trim().length === 0) return null;
+  let cleaned = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+
+  // Try direct parse — might be a valid array already
+  try {
+    const parsed = JSON.parse(cleaned);
+    if (Array.isArray(parsed) && parsed.length > 0 && parsed[0].npc && parsed[0].msg) {
+      return parsed;
+    }
+    // If AI returned old object format {NPC: msg}, convert to array
+    if (!Array.isArray(parsed) && typeof parsed === 'object') {
+      const npcNames = Object.keys(NPC_PERSONALITIES);
+      const arr = [];
+      for (const key of npcNames) {
+        if (parsed[key] && typeof parsed[key] === 'string' && parsed[key].trim()) {
+          arr.push({ npc: key, msg: parsed[key].substring(0, 200) });
+        }
+      }
+      if (arr.length >= 2) { state.repairCount++; return arr; }
+    }
+  } catch {}
+
+  // Try to repair truncated array
+  if (cleaned.startsWith('[')) {
+    // Find last complete object in array
+    const objRx = /\{\s*"npc"\s*:\s*"(Elena|Marco|Gruk|Bones)"\s*,\s*"msg"\s*:\s*"([^"]{1,200})"\s*\}/g;
+    const items = [];
+    let match;
+    while ((match = objRx.exec(cleaned)) !== null) {
+      items.push({ npc: match[1], msg: match[2] });
+    }
+    if (items.length >= 2) { state.repairCount++; return items; }
+  }
+
+  // Fallback: try old object format repair and convert
+  const fallback = repairJSON(cleaned);
+  if (fallback && typeof fallback === 'object' && !Array.isArray(fallback)) {
+    const npcNames = Object.keys(NPC_PERSONALITIES);
+    const arr = [];
+    for (const key of npcNames) {
+      if (fallback[key] && typeof fallback[key] === 'string' && fallback[key].trim()) {
+        arr.push({ npc: key, msg: fallback[key].substring(0, 200) });
+      }
+    }
+    if (arr.length >= 2) return arr;
+  }
+
+  return null;
+}
+
 // ── System Prompt ───────────────────────────────────────────
 function buildSystemPrompt(npcActivities, npcMoodData) {
   const descs = Object.entries(NPC_PERSONALITIES).map(([key, p]) => {
@@ -340,11 +392,11 @@ async function callGemini(geminiKey, systemPrompt, userMessage) {
 }
 
 // ── Main request: tries Groq first, then Gemini ─────────────
-export async function getAllNPCResponses(apiKeys, playerName, playerMessage, npcActivities, playerMemory, npcMoodData) {
-  return enqueueRequest(() => _doRequest(apiKeys, playerName, playerMessage, npcActivities, playerMemory, npcMoodData));
+export async function getAllNPCResponses(apiKeys, playerName, playerMessage, npcActivities, playerMemory, npcMoodData, customSystemPrompt) {
+  return enqueueRequest(() => _doRequest(apiKeys, playerName, playerMessage, npcActivities, playerMemory, npcMoodData, customSystemPrompt));
 }
 
-async function _doRequest(apiKeys, playerName, playerMessage, npcActivities, playerMemory, npcMoodData) {
+async function _doRequest(apiKeys, playerName, playerMessage, npcActivities, playerMemory, npcMoodData, customSystemPrompt) {
   const { groqKey, geminiKey } = apiKeys;
   const msgLower = playerMessage.toLowerCase();
   const npcNames = Object.keys(NPC_PERSONALITIES);
@@ -368,7 +420,8 @@ async function _doRequest(apiKeys, playerName, playerMessage, npcActivities, pla
     ? `[Reciente]:\n${recent}\n\n${playerName}: ${playerMessage}${hint}${memoryCtx}`
     : `${playerName}: ${playerMessage}${hint}${memoryCtx}`;
 
-  const systemPrompt = buildSystemPrompt(npcActivities, npcMoodData);
+  // Use custom system prompt (from social engine) or build default
+  const systemPrompt = customSystemPrompt || buildSystemPrompt(npcActivities, npcMoodData);
 
   state.requestCount++;
   const reqNum = state.requestCount;
@@ -472,14 +525,14 @@ async function _doRequest(apiKeys, playerName, playerMessage, npcActivities, pla
 }
 
 // ── NPC-to-NPC conversation ─────────────────────────────────
-export async function getNPCConversation(apiKeys, npcActivities) {
-  return enqueueRequest(() => _doNPCConversation(apiKeys, npcActivities));
+export async function getNPCConversation(apiKeys, npcActivities, customSystemPrompt, customUserMsg) {
+  return enqueueRequest(() => _doNPCConversation(apiKeys, npcActivities, customSystemPrompt, customUserMsg));
 }
 
-async function _doNPCConversation(apiKeys, npcActivities) {
+async function _doNPCConversation(apiKeys, npcActivities, customSystemPrompt, customUserMsg) {
   const { groqKey, geminiKey } = apiKeys;
-  const systemPrompt = buildSystemPrompt(npcActivities);
-  const userMsg = `NPCs hablan entre sí. 2 NPCs charlan (max 40 chars). JSON puro.`;
+  const systemPrompt = customSystemPrompt || buildSystemPrompt(npcActivities);
+  const userMsg = customUserMsg || `NPCs hablan entre sí. 2 NPCs charlan (max 40 chars). JSON puro.`;
 
   state.requestCount++;
   let result = null;
@@ -494,16 +547,26 @@ async function _doNPCConversation(apiKeys, npcActivities) {
   }
   if (!result) { state.failCount++; return null; }
 
-  const parsed = repairJSON(result.text);
-  if (!parsed) return null;
-
-  const responses = {};
-  for (const key of Object.keys(NPC_PERSONALITIES)) {
-    if (parsed[key] && typeof parsed[key] === 'string' && parsed[key].trim()) {
-      responses[key] = parsed[key].substring(0, 200);
-    }
+  // Try array format first (new sequential format), fallback to object
+  const parsed = repairConversationArray(result.text);
+  if (parsed && Array.isArray(parsed) && parsed.length >= 2) {
+    state.successCount++;
+    console.log(`[AI] ✅ NPC conversation (array): ${parsed.map(t => t.npc).join(' → ')}`);
+    return parsed;
   }
-  if (Object.keys(responses).length >= 2) { state.successCount++; return responses; }
+
+  // Fallback: old object format → convert to array
+  const objParsed = repairJSON(result.text);
+  if (objParsed) {
+    const arr = [];
+    for (const key of Object.keys(NPC_PERSONALITIES)) {
+      if (objParsed[key] && typeof objParsed[key] === 'string' && objParsed[key].trim()) {
+        arr.push({ npc: key, msg: objParsed[key].substring(0, 200) });
+      }
+    }
+    if (arr.length >= 2) { state.successCount++; return arr; }
+  }
+
   return null;
 }
 
