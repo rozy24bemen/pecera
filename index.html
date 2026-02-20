@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>🌻 Sunnyside World</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <canvas id="game-canvas"></canvas>
+
+  <!-- Pantalla de inicio -->
+  <div id="start-screen">
+    <div id="start-box">
+      <h1>🌻 Sunnyside World</h1>
+      <p>Tu mundo pixel-art multijugador</p>
+
+      <div class="form-group">
+        <label>Nombre</label>
+        <input type="text" id="player-name" value="Hero" maxlength="16" />
+      </div>
+
+      <div class="form-group">
+        <label>Tipo de personaje</label>
+        <select id="player-type">
+          <option value="human">🧑 Humano</option>
+          <option value="goblin">👺 Goblin</option>
+          <option value="skeleton">💀 Skeleton</option>
+        </select>
+      </div>
+
+      <div class="form-group">
+        <label>Peinado (solo Humano)</label>
+        <select id="player-hair">
+          <option value="base">Sin pelo</option>
+          <option value="shorthair" selected>Corto</option>
+          <option value="longhair">Largo</option>
+          <option value="curlyhair">Rizado</option>
+          <option value="mophair">Mop</option>
+          <option value="bowlhair">Bowl</option>
+          <option value="spikeyhair">Spikey</option>
+        </select>
+      </div>
+
+      <div class="form-group">
+        <label>Tipo de mundo</label>
+        <select id="world-type">
+          <option value="village">🏘️ Aldea</option>
+          <option value="forest">🌲 Bosque</option>
+          <option value="island">🏝️ Isla</option>
+          <option value="empty">⬜ Vacío</option>
+        </select>
+      </div>
+
+      <button id="btn-start">⚔️ Entrar al mundo</button>
+
+      <div class="controls-help">
+        <p><b>Controles:</b></p>
+        <p>WASD / Flechas = Mover</p>
+        <p>Click izq / derecho = Ir a posición</p>
+        <p>Enter = Chat</p>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>
